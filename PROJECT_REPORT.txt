@@ -1,0 +1,450 @@
+================================================================================
+                          PROJECT REPORT
+                  Distributed Search Typeahead Service
+================================================================================
+
+Report Date : 2026-06-22
+Repository  : /e/Learn/Typeahead
+Branch      : main
+Latest Tag  : V1 ("Created the V1 of the Project")
+Runtime     : Bun (1.x)
+Language    : TypeScript (ESNext, strict mode)
+
+================================================================================
+1. EXECUTIVE SUMMARY
+================================================================================
+
+The project is a horizontally-scaled autocomplete (typeahead) service built
+end-to-end on the Bun runtime. It supports prefix-based search suggestions
+across a multi-shard cluster, accepts high-volume "completed search" writes,
+ranks suggestions by either all-time popularity or a recency-blended score,
+and surfaces a global "trending" board.
+
+Architecturally, the system separates the durable source of truth (a single
+central Postgres database) from the read-fast derived caches (three Redis
+shards), connected by a derived cache-updater pipeline that ensures any live
+search becomes visible on the correct shard regardless of which node wrote it.
+All client traffic flows through a single Bun-based load balancer that uses
+a consistent-hash ring (FNV-1a + 150 virtual nodes per shard) to deterministic-
+ally route every prefix or query to its owning app node.
+
+Headline performance (from the included benchmark harness, see PERFORMANCE.md):
+  - /suggest latency p95   : 1.21 ms (basic) / 1.35 ms (recency)
+  - /suggest mean / p99    : 0.63 ms / 2.26 ms
+  - Throughput (c=32)      : ~50,000 req/s on a single dev box
+  - Cache hit rate         : 100% on seeded prefixes (DB fallback verified)
+  - Write reduction        : 90.9x (search requests collapsed per DB txn)
+
+================================================================================
+2. PROJECT GOALS AND SCOPE
+================================================================================
+
+The system must:
+
+  1. Provide low-latency typeahead suggestions for an arbitrary search prefix.
+  2. Scale horizontally by sharding both the cache and the read/write path.
+  3. Absorb a stream of completed search events without per-request DB writes.
+  4. Keep a global "trending right now" view across shards.
+  5. Support two ranking modes over the same candidate set:
+       - basic   : ordered by all-time count
+       - recency : ordered by a log-compressed blended score that lets recent
+                   bursts overtake stale historical giants without flapping.
+  6. Decay both trending scores and the recency signal over time so that
+     short-lived spikes can fade back to their true rank.
+  7. Be reproducible: docker compose up brings up the full 7-container cluster
+     and a one-shot seed job loads the dataset.
+
+Non-functional targets explicitly tracked in PERFORMANCE.md include sub-2 ms
+p95 read latency, measurable write reduction from batching, and reasonable
+balance across the three shards.
+
+================================================================================
+3. HIGH-LEVEL ARCHITECTURE
+================================================================================
+
+Components (deployed via docker-compose, see docker-compose.yml):
+
+  1 x lb              Public entrypoint; consistent-hash reverse proxy + static
+                      frontend host (src/lb.ts).
+  3 x appN            Stateless Bun HTTP nodes, each paired 1:1 with one Redis
+                      shard. The ONLY writer of its own shard (src/server.ts).
+  3 x redisN          Per-shard suggestion ZSETs (q:<prefix>, qr:<prefix>) plus
+                      a per-shard trending ZSET.
+  1 x postgres        Central authoritative store: query_counts, dirty_prefixes
+                      (src/db.ts).
+  1 x cache-updater   Polls dirty_prefixes, recomputes top-K from Postgres,
+                      groups by route(prefix), POSTs to the OWNING app node's
+                      /internal/cache. Holds no Redis connection
+                      (src/cache-updater.ts).
+  (seed)              One-shot dataset loader. Loads Postgres then derives both
+                      shard caches in one window-function pass per prefix length
+                      (scripts/seed.ts).
+
+Network isolation: each appN shares a private Docker network ONLY with its
+own redisN, plus a separate mesh network shared with the LB and updater, plus
+a pg network for Postgres. This enforces "each Redis has exactly one writer"
+at the kernel level, not just in code.
+
+Read path (GET /suggest?q=p[&rank=basic|recency]):
+  client -> LB -> hash(p) -> appN -> ZREVRANGE on redisN
+           |
+           +-- on cache miss: appN falls back to Postgres top-K and marks the
+               prefix dirty so the updater warms the cache.
+
+Write path (POST /search {query}):
+  client -> LB -> hash(query) -> appN -> push to in-memory buffer -> 202
+  When the buffer fills (BATCH_SIZE=100) or FLUSH_INTERVAL_MS expires:
+    appN -> 1) ZINCRBY trending on its own Redis (approximate first)
+         -> 2) UPSERT counts + recent_count into Postgres
+         -> 3) INSERT prefixes into dirty_prefixes (same transaction)
+  cache-updater:
+    -> DELETE ... RETURNING dirty_prefixes (atomic claim)
+    -> for each prefix: recompute top-K (both rankings) from Postgres
+    -> group by route(prefix), POST one batch per owning shard's app node
+    -> app node atomically replaces its q:<prefix> and qr:<prefix> via Lua
+
+Why this shape: an earlier design wrote suggestion caches directly from the
+app node, but that meant a live search on hash(query)=shard A could not
+update prefixes owned by hash(prefix)=shard B. The current pipeline routes
+every cache mutation through route(prefix), so a live search becomes globally
+visible while each Redis still has exactly one writer.
+
+================================================================================
+4. SOURCE TREE
+================================================================================
+
+src/
+  hash-ring.ts      FNV-1a 32-bit + 150 virtual nodes per shard. The shared
+                    deterministic router imported by every process.
+  config.ts         Knobs, prefix generation, key naming, RankMode helpers,
+                    shard URL resolution. Single source of truth for shape.
+  db.ts             Bun.sql (Postgres) layer: schema bootstrap, transactional
+                    record-and-dirty UPSERT, top-K and recency-top-K queries,
+                    cold-start derivation generator, recent_count decay UPDATE.
+  server.ts         App node HTTP server. Endpoints: /suggest, /search,
+                    /trending, /metrics, /cache/debug, /health,
+                    /internal/cache. Batch writer + trending decay.
+  cache-updater.ts  Central derived-cache builder. Owns the recency_count
+                    decay loop. Has no Redis client.
+  lb.ts             Consistent-hash reverse proxy + frontend host + /trending
+                    fan-out merge + /metrics aggregation.
+
+scripts/
+  seed.ts           Two-phase loader: Postgres dataset load, then derive both
+                    caches per prefix length.
+  bench.ts          HTTP-only benchmark harness. p50/p90/p95/p99 latency, cache
+                    hit rate, write reduction from /metrics.
+  demo-recency.ts   Before/after side-by-side basic vs. recency ranking demo.
+
+test/
+  config.test.ts    normalize, prefixesOf (Unicode safety), fnv1a32 vectors,
+                    empty-ring guard.
+  hash-ring.test.ts Determinism across independent ring instances; distribution
+                    within +/-25%; wrap-around safety for all prefixes.
+
+public/
+  index.html        Vanilla-JS UI: input box + suggestions list + trending.
+  script.js         150 ms debounced suggest, keyboard nav, search submit,
+                    trending refresh.
+
+data/
+  search_frequencies.json   Aggregated search-query frequency log (raw 93,396
+                            rows; 93,387 usable; 1,724,222 total events).
+
+docs/
+  API.md            Full HTTP reference for every public endpoint.
+  screenshots/      UI screenshots referenced from the README.
+
+docker-compose.yml  7-container cluster definition with strict per-shard nets.
+Dockerfile          Shared image for the LB, app nodes, updater, and seed job.
+package.json        Bun scripts (seed, lb, app, updater, bench, demo:recency,
+                    dev:appN, dev:lb, dev:updater, test, up, down).
+tsconfig.json       Bun + strict TS settings.
+README.md           Top-level design + how-it-works + run instructions.
+PERFORMANCE.md      Reproducible performance report.
+Agent.md            Original phased execution plan (Phase 1-4).
+Architecture.png    System diagram.
+
+================================================================================
+5. KEY DESIGN DECISIONS
+================================================================================
+
+5.1 Consistent hashing as the single routing primitive
+    FNV-1a 32-bit + 150 virtual nodes per shard. The exact same ring code is
+    imported by the seeder, LB, app node, and cache-updater. Because every
+    process builds the ring from the same SHARDS list and VIRTUAL_NODES count,
+    route(key) is globally consistent: a given prefix always resolves to the
+    same shard everywhere. Tests assert independent ring instances agree
+    and that 30,000 random keys spread within +/-25% across shards.
+
+5.2 Postgres as the source of truth, Redis as derived cache
+    The app node never writes to Redis on the user-facing path. /search
+    UPSERTs into Postgres and marks prefixes dirty; the cache-updater is the
+    sole writer of refreshed top-K caches, but it pushes them through the
+    OWNING app node (POST /internal/cache), preserving "one writer per shard".
+
+5.3 In-memory buffer + batch writer
+    /search returns 202 immediately. A flush triggers the moment the buffer
+    hits BATCH_SIZE (default 100) or after FLUSH_INTERVAL_MS (default 5s).
+    Each flush dedups counts in a Map, then UPSERTs counts and INSERTs dirty
+    prefixes in one Postgres transaction. Measured ~91x write reduction.
+
+    Failure trade-offs:
+      - A crash before flush loses at most BATCH_SIZE-1 buffered queries.
+        This is acceptable for approximate popularity counts.
+      - SIGTERM/SIGINT trigger a final drain.
+      - A failed chunk is re-queued to the FRONT of the buffer, not dropped.
+      - Ordering: trending ZINCRBY happens BEFORE the authoritative Postgres
+        upsert so a retry can only double-count trending, never the truth.
+
+5.4 Recency-aware ranking via a SECOND per-prefix ZSET (qr:<prefix>)
+    Score formula (single source of truth in db.ts as RECENCY_SCORE_SQL):
+
+        score = HIST_WEIGHT * log2(1 + count)
+              + RECENCY_WEIGHT * log2(1 + recent_count)
+        defaults: HIST_WEIGHT=1, RECENCY_WEIGHT=3
+
+    Both signals are log-compressed (diminishing returns), so a burst on a
+    modestly-popular query can overtake a stale all-time leader, while a
+    single search cannot. recent_count is decayed periodically by the cache-
+    updater (UPDATE ... recent_count = floor(recent_count * f)) and the
+    affected prefixes are re-marked dirty so the served recency cache fades.
+    count is NEVER decayed, so true long-term popularity persists.
+
+5.5 Trending per shard, merged at the LB
+    Each shard owns the trending ZSET for queries whose hash routes there.
+    GET /trending fans out to all three nodes and re-sorts the union. A
+    10%/day decay (Lua script in app server, atomic ZRANGE-then-ZADD) keeps
+    historically huge queries from permanently owning the board.
+
+5.6 Atomic cache replacement under load
+    The /internal/cache writer uses a Lua script that does DEL + ZADD in one
+    call, so /suggest never observes an empty ZSET mid-rebuild. The same
+    pattern is used for the trending decay.
+
+5.7 Sole-writer enforcement at multiple layers
+    - Docker compose: each appN only shares a network with its own redisN.
+    - App-node code: POST /internal/cache rejects any prefix that
+      route(prefix) does not equal SHARD_ID (returns rejected count).
+
+5.8 Cap on prefix generation
+    MAX_PREFIX_LEN=32. The raw dataset contains 500-char junk rows; capping
+    bounds both the seed-time cache footprint and runtime batch writes.
+
+5.9 Unicode-safe prefixing
+    prefixesOf splits on code points (Array.from) so emoji and surrogate pairs
+    are never sliced in half. Tested explicitly.
+
+5.10 Postgres LIKE 'prefix%' as a range scan
+     query_counts.query is indexed with text_pattern_ops so the cold-start
+     and live top-K queries are range scans regardless of DB collation.
+
+================================================================================
+6. PUBLIC HTTP API (via LB http://localhost:8080)
+================================================================================
+
+GET /suggest?q=<prefix>[&rank=basic|recency][&limit=N]
+    Up to N suggestions starting with <prefix>. Falls back to Postgres on
+    cache miss, returning source: "db" instead of "cache", and warms the
+    cache by marking the prefix dirty (fire-and-forget).
+
+POST /search   body: {"query": "..."}
+    Records a completed search. Buffered, 202 returned immediately. The
+    update becomes globally visible after the next batch flush and the
+    next updater cycle.
+
+GET /trending[?limit=N]
+    Globally merged trending board. Each query lives on exactly one shard;
+    the LB unions the per-shard tops and re-sorts.
+
+GET /cache/debug?prefix=<p>
+    Returns the owning node/shard, the q: and qr: ZSET cardinalities, and
+    a hit/miss verdict. Useful for verifying ownership in writeups.
+
+GET /metrics
+    Cluster-wide counters (searchesReceived, batchesFlushed, rowsUpserted,
+    cacheHits, cacheMisses, cacheHitRate, writeReduction, buffered) plus
+    per-node breakdown. Backs PERFORMANCE.md.
+
+Internal (NOT proxied by the LB; only on the mesh network):
+POST /internal/cache       cache-updater pushes refreshed top-K here.
+GET  /health               per-node Redis + Postgres reachability.
+
+================================================================================
+7. DATA MODEL
+================================================================================
+
+Postgres (durable):
+  query_counts(
+    query        TEXT PRIMARY KEY,
+    count        BIGINT NOT NULL,            -- permanent total
+    recent_count BIGINT NOT NULL DEFAULT 0   -- decayed recency signal
+  );
+  -- text_pattern_ops index for LIKE 'prefix%' range scans
+  CREATE INDEX query_counts_query_pattern_idx
+    ON query_counts (query text_pattern_ops);
+
+  dirty_prefixes(
+    prefix    TEXT PRIMARY KEY,
+    dirty_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+  );   -- atomic claim via DELETE ... RETURNING
+
+Redis (per shard, derived from Postgres):
+  q:<prefix>    ZSET of top-CACHE_K queries by all-time count.
+  qr:<prefix>   ZSET of the same prefix ranked by the blended recency score.
+  trending      Per-shard ZSET; LB merges across shards on read.
+
+================================================================================
+8. CONFIGURATION (selected env vars; full list in README)
+================================================================================
+
+DATABASE_URL                  Postgres URL.
+BATCH_SIZE                    100      Buffer size that triggers a flush.
+FLUSH_INTERVAL_MS             5000     Safety-net flush for partial buffers.
+MAX_PREFIX_LEN                32       Cap on prefix generation.
+CACHE_K                       50       Depth of each derived top-K cache.
+CACHE_POLL_INTERVAL_MS        1000     Cache-updater poll cadence.
+CACHE_DIRTY_BATCH             200      Max prefixes claimed per updater cycle.
+SUGGEST_LIMIT / TRENDING_LIMIT 10 / 10 Default result counts.
+DECAY_FACTOR / DECAY_INTERVAL_MS    0.9 / 86_400_000   (trending, daily 10%).
+RECENCY_HIST_WEIGHT / RECENCY_WEIGHT 1 / 3
+RECENCY_DECAY_FACTOR / RECENCY_DECAY_INTERVAL_MS  0.5 / 3_600_000
+SHARD_ID, PORT, REDIS_URL    Per-app-node identity.
+REDIS_URL_1/2/3              Used by seeder.
+APP_URL_1/2/3, LB_PORT       LB and cache-updater addressing.
+
+================================================================================
+9. PERFORMANCE SUMMARY (excerpt from PERFORMANCE.md)
+================================================================================
+
+  /suggest latency (4000 reqs, c=32, against the LB through to Redis):
+    rank    mean    p50     p90     p95     p99    throughput
+    basic   0.63    0.52    1.05    1.21    2.26   ~50,400 req/s
+    recency 0.63    0.52    1.12    1.35    2.49   ~50,800 req/s
+
+  Cache hit rate: 100% on seeded prefixes. Postgres fallback path verified
+  by manually evicting a key and watching the updater rewarm it.
+
+  Write reduction from batching: 90.9x (2000 searches collapsed into 22
+  Postgres batch transactions; 410 unique rows upserted).
+
+  Shard distribution (cold seed): 431k / 335k / 587k cache members across
+  shards 1/2/3. Skew comes from English prefix-keyspace clumping, not the
+  ring. Random-key distribution test passes within +/-25%.
+
+Caveat: all containers run on a single dev box; absolute numbers are
+optimistic since there is no real network between the LB and the app nodes.
+What generalises is the SHAPE: cache vs. DB fallback, batched vs. per-request
+writes.
+
+================================================================================
+10. TESTING
+================================================================================
+
+bun test exercises (no cluster required):
+  - normalize handles trim/lowercase + Unicode NFC (cafe + combining acute
+    -> cafe-with-acute).
+  - prefixesOf splits emojis and surrogate pairs without breakage.
+  - fnv1a32 matches standard FNV-1a vectors (UTF-8 byte hashing).
+  - HashRing throws on empty shards list (defensive guard).
+  - route() is deterministic across independent ring instances.
+  - 30,000 random keys distribute within +/-25% across shards.
+  - Every prefix of a sample key resolves to a valid shard (wrap-around).
+
+End-to-end:
+  - scripts/bench.ts drives the running cluster through the LB only,
+    measuring real latency, hit rate and write reduction from /metrics.
+  - scripts/demo-recency.ts demonstrates the basic vs. recency reorder
+    under a real burst and watches the spike decay to its true rank.
+
+================================================================================
+11. RUNNING THE PROJECT
+================================================================================
+
+Full cluster (Docker Compose):
+    docker compose up --build
+    # postgres + redis come up healthy; the seed job loads Postgres and
+    # derives the shard caches, then exits; app1/2/3, cache-updater and lb
+    # start. Open http://localhost:8080.
+
+Local dev (one Redis with 3 logical DBs + one Postgres):
+    docker run -d -p 6379:6379 redis:7-alpine
+    docker run -d -p 5432:5432 \
+        -e POSTGRES_USER=typeahead \
+        -e POSTGRES_PASSWORD=typeahead \
+        -e POSTGRES_DB=typeahead postgres:16-alpine
+    bun run seed
+    bun run dev:app1 & bun run dev:app2 & bun run dev:app3 &
+    bun run dev:updater &
+    bun run dev:lb
+
+Tests, benchmark, demos:
+    bun test
+    bun run bench
+    bun run demo:recency
+
+================================================================================
+12. OBSERVED STRENGTHS
+================================================================================
+
+  - Single-source-of-truth design with one Redis writer per shard makes the
+    system easy to reason about under failure: any cache can be rebuilt
+    from Postgres by re-marking prefixes dirty; the dirty queue itself is
+    the only fragile state, and a claimed-but-failed batch is re-marked.
+
+  - Identical ranking SQL (RECENCY_SCORE_SQL) is shared between the cold-
+    start derivation, the live cache-updater rebuild, and the on-miss DB
+    fallback, eliminating drift between code paths.
+
+  - The write path is engineered for retry safety: trending ZINCRBY first
+    (approximate, idempotent enough), Postgres UPSERT + dirty_prefixes
+    inside one transaction last. A failed batch is re-queued to the front
+    of the buffer rather than dropped.
+
+  - Heavy reliance on Bun's first-class primitives: Bun.serve, Bun.sql,
+    bun.RedisClient, Bun.file. Zero runtime dependencies in package.json
+    (only @types/bun in devDependencies). The Dockerfile is consequently
+    minimal and the cold-start surface is small.
+
+  - Every routing and config primitive is exercised by both unit tests and
+    the end-to-end bench/demo harnesses.
+
+================================================================================
+13. POSSIBLE FUTURE WORK
+================================================================================
+
+  1. Persist the in-memory write buffer (or fsync after every flush) for
+    workloads where losing the last BATCH_SIZE-1 writes is unacceptable.
+  2. Add a structured request log (request id, route decision, latency) so
+    LB logs can be analysed offline.
+  3. Compress qr:<prefix> reads with a single LB-side query parameter that
+    chooses ranking, instead of two separate ZSETs per prefix (memory
+    halving at the cost of a small read-time computation).
+  4. Per-shard horizontal scale-out: replace the static SHARDS list with
+    a runtime-managed ring (add/remove nodes without re-seeding all keys,
+    e.g. via key migration windows).
+  5. Move the seed job from "single one-shot" to "incremental upsert" to
+    support dataset refreshes without truncating Postgres.
+  6. Replace the manual JSON dataset loader with a CSV/parquet streamer so
+    larger datasets can be ingested without loading the full array into JS.
+
+================================================================================
+14. RECENT REPOSITORY STATE
+================================================================================
+
+Latest commit on main:
+    0acd920  Created the V1 of the Project
+
+Uncommitted modifications observed (as of report generation):
+    M  Agent.md
+    M  PERFORMANCE.md
+    M  README.md
+    M  docs/API.md
+    M  src/server.ts
+
+These are content updates to the docs and the app server; review before
+the next commit.
+
+================================================================================
+END OF REPORT
+================================================================================

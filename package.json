@@ -1,0 +1,28 @@
+{
+  "name": "typeahed",
+  "module": "src/lb.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "seed": "bun run scripts/seed.ts",
+    "lb": "bun run src/lb.ts",
+    "app": "bun run src/server.ts",
+    "updater": "bun run src/cache-updater.ts",
+    "bench": "bun run scripts/bench.ts",
+    "demo:recency": "bun run scripts/demo-recency.ts",
+    "dev:app1": "SHARD_ID=1 PORT=3001 bun run --watch src/server.ts",
+    "dev:app2": "SHARD_ID=2 PORT=3002 bun run --watch src/server.ts",
+    "dev:app3": "SHARD_ID=3 PORT=3003 bun run --watch src/server.ts",
+    "dev:lb": "bun run --watch src/lb.ts",
+    "dev:updater": "bun run --watch src/cache-updater.ts",
+    "test": "bun test",
+    "up": "docker compose up --build",
+    "down": "docker compose down -v"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  }
+}

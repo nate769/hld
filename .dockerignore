@@ -1,0 +1,10 @@
+node_modules
+.git
+.gitignore
+*.log
+.env
+.env.*
+# Root duplicate of the dataset; the seeder reads data/search_frequencies.json.
+/search_frequencies.json
+data/OLD_search_frequencies.json
+Agent.md

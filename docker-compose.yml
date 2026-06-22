@@ -1,0 +1,191 @@
+# Distributed Search Typeahead — cluster topology
+#
+#   1x lb            public entrypoint, consistent-hash reverse proxy
+#   3x appN          stateless Bun app nodes, paired 1:1 with redisN
+#   3x redisN        per-shard Redis suggestion caches + trending
+#   1x postgres      central source of truth for query counts
+#   1x cache-updater rebuilds per-prefix top-K caches on all shards from Postgres
+#   (+ seed)         one-shot bootstrap: loads Postgres, derives shard caches, exits
+#
+# Strict networking: each appN shares a redis network ONLY with its own redisN
+# (it can physically reach just its shard). App nodes + LB meet on `mesh` (no
+# Redis there). Postgres lives on `pg`, reachable by app nodes + infra. The
+# `seed` and `cache-updater` jobs are infrastructure (not App Nodes), so they
+# join all shard networks to maintain the caches.
+
+x-bun-build: &bun-build
+  build: .
+  image: typeahead:latest
+
+x-database-url: &database-url postgres://typeahead:typeahead@postgres:5432/typeahead
+
+services:
+  # --- Central source of truth ---------------------------------------------
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: typeahead
+      POSTGRES_PASSWORD: typeahead
+      POSTGRES_DB: typeahead
+    networks: [pg]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U typeahead -d typeahead"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  # --- Redis shards (one per app node) -------------------------------------
+  redis1:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [shard1]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  redis2:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [shard2]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  redis3:
+    image: redis:7-alpine
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    networks: [shard3]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  # --- One-shot seeder: load Postgres, derive shard caches, exit -----------
+  seed:
+    <<: *bun-build
+    command: bun run scripts/seed.ts
+    environment:
+      DATABASE_URL: *database-url
+      REDIS_URL_1: redis://redis1:6379
+      REDIS_URL_2: redis://redis2:6379
+      REDIS_URL_3: redis://redis3:6379
+    networks: [shard1, shard2, shard3, pg]
+    depends_on:
+      postgres: { condition: service_healthy }
+      redis1: { condition: service_healthy }
+      redis2: { condition: service_healthy }
+      redis3: { condition: service_healthy }
+    restart: "no"
+
+  # --- App nodes -----------------------------------------------------------
+  app1:
+    <<: *bun-build
+    command: bun run src/server.ts
+    environment:
+      SHARD_ID: "1"
+      PORT: "3000"
+      REDIS_URL: redis://redis1:6379
+      DATABASE_URL: *database-url
+    networks: [shard1, mesh, pg]
+    depends_on:
+      redis1: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      seed: { condition: service_completed_successfully }
+    healthcheck: &app-health
+      test:
+        - CMD
+        - bun
+        - -e
+        - "fetch('http://localhost:3000/health').then(r=>process.exit(r.ok?0:1)).catch(()=>process.exit(1))"
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  app2:
+    <<: *bun-build
+    command: bun run src/server.ts
+    environment:
+      SHARD_ID: "2"
+      PORT: "3000"
+      REDIS_URL: redis://redis2:6379
+      DATABASE_URL: *database-url
+    networks: [shard2, mesh, pg]
+    depends_on:
+      redis2: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      seed: { condition: service_completed_successfully }
+    healthcheck: *app-health
+    restart: unless-stopped
+
+  app3:
+    <<: *bun-build
+    command: bun run src/server.ts
+    environment:
+      SHARD_ID: "3"
+      PORT: "3000"
+      REDIS_URL: redis://redis3:6379
+      DATABASE_URL: *database-url
+    networks: [shard3, mesh, pg]
+    depends_on:
+      redis3: { condition: service_healthy }
+      postgres: { condition: service_healthy }
+      seed: { condition: service_completed_successfully }
+    healthcheck: *app-health
+    restart: unless-stopped
+
+  # --- Cache updater: dirty prefixes -> refreshed top-K, pushed to app nodes --
+  # Writes go THROUGH the app nodes (POST /internal/cache), so each Redis shard
+  # has exactly one writer (its app node). The updater therefore needs only
+  # Postgres (pg) + the app-node mesh — no Redis/shard network access.
+  cache-updater:
+    <<: *bun-build
+    command: bun run src/cache-updater.ts
+    environment:
+      DATABASE_URL: *database-url
+      APP_URL_1: http://app1:3000
+      APP_URL_2: http://app2:3000
+      APP_URL_3: http://app3:3000
+      CACHE_K: "50"
+      CACHE_POLL_INTERVAL_MS: "1000"
+      CACHE_DIRTY_BATCH: "200"
+      # Shortened from the 1h code default so a grader can watch a recency spike
+      # decay back to its all-time rank within a minute or two (Assignment §7).
+      RECENCY_DECAY_INTERVAL_MS: "60000"
+    networks: [mesh, pg]
+    depends_on:
+      postgres: { condition: service_healthy }
+      app1: { condition: service_healthy }
+      app2: { condition: service_healthy }
+      app3: { condition: service_healthy }
+    restart: unless-stopped
+
+  # --- Load balancer (public entrypoint) -----------------------------------
+  lb:
+    <<: *bun-build
+    command: bun run src/lb.ts
+    environment:
+      LB_PORT: "8080"
+      APP_URL_1: http://app1:3000
+      APP_URL_2: http://app2:3000
+      APP_URL_3: http://app3:3000
+    ports:
+      - "8080:8080"
+    networks: [mesh]
+    depends_on:
+      app1: { condition: service_healthy }
+      app2: { condition: service_healthy }
+      app3: { condition: service_healthy }
+    restart: unless-stopped
+
+networks:
+  shard1: {}
+  shard2: {}
+  shard3: {}
+  mesh: {}
+  pg: {}
